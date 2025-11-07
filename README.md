@@ -56,13 +56,7 @@ The script writes all artifacts to `toy-md/outputs/`.
 Runs fast and produces a subset of outputs:
   
 ```bash
-python run_toy_md.py \
-  --samplers pc_ula \
-  --K 10 \
-  --kl-runs 200 \
-  --sweep-runs 200 \
-  --refresh-L 2 \
-  --points-per-seed 10
+python run_toy_md.py
 ```
 
 Check `outputs/` for `metrics.json`, `action_match_pc_ula.png`, `state_match_pc_ula.png`, and `action_kl_vs_refresh.png` / `state_kl_vs_refresh.png`.
