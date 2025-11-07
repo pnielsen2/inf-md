@@ -1,0 +1,459 @@
+\documentclass{article}
+
+% Pass natbib options before neurips_2025, which loads natbib internally.
+\PassOptionsToPackage{numbers,sort&compress}{natbib}
+\usepackage[preprint]{neurips_2025}
+
+\makeatletter
+\renewcommand{\@notice}{} % suppress footer notice if desired
+\makeatother
+
+% Minimal, course-compliant preamble
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{amsthm}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{mathtools}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e} % for algorithm, \KwIn, \For, \If, \tcp
+
+% Handy math macros
+\newcommand{\E}{\mathbb{E}}
+
+% Theorem environments
+\newtheorem{lemma}{Lemma}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}{Proposition}[section]
+
+\title{Action-Only Recurrent Langevin with Conditional Refresh for Online Learning of Diffusion Policies}
+
+\author{Philip Nielsen}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study inference-time mirror descent for diffusion policies, targeting the action marginal
+\(\pi_\beta(a\mid s)\propto q(a\mid s)\exp\{\beta Q(s,a)\}\).
+At each noise level \(t\), we define a product-of-experts tilt
+\(\tilde q_t(a,s'\mid s)\propto \exp(\log q_t(a,s'\mid s)+\beta_t Q_t(s,a))\),
+which leaves the conditional \(q_t(s'\mid a,s)\) unchanged.
+Our sampler is reverse--SDE predictor--corrector with a \emph{PoE action score}
+\(s_\theta^{(a)}(a,s',t)+\beta_t\nabla_a Q_t(s,a)\) and a conditional \(s'\) refresh that clamps \(a\).
+We use pre-trained, noise-conditioned heads \(r_\rho,V_\eta\) to form \(Q_t\); the backbone diffusion is not retrained and no separate dynamics are learned.
+Finite-step bias from ULA and time discretization is mitigated by a single preconditioned MALA step on actions per level and an optional Barker/MALA accept on the final \(s'\) refresh.
+Under standard PC assumptions and per-level mixing, the sampler tracks \(\tilde q_t\) and yields the mirror–descent action marginal at \(t\!\to\!0\).
+A deterministic PF--ODE (DDIM-style) variant is moved to the appendix for completeness.
+All comparisons optimize mean return as a function of environment steps.
+We compare against DPMD/SDAC and trajectory-guided Diffuser baselines.
+\end{abstract}
+
+\section{Background and Motivation}
+
+\paragraph{Setting.}
+We act in state \(s\) by denoising a joint diffusion over \(x=(a,s')\), where \(a\) is the action and \(s'\) the one-step successor (or a short successor sequence for planning).
+Reverse time is \(t\in[1\!\to\!0]\).
+The model provides either a reverse--SDE \emph{predictor--corrector (PC)} sampler or a \emph{probability--flow ODE (PF--ODE; DDIM-style)} sampler, with score \(s_\theta(x,t)=\nabla_x\log q_t(x)\).
+
+\paragraph{Control target.}
+For temperature \(\beta>0\), mirror descent yields
+\(\pi_\beta(a\mid s)\propto q(a\mid s)\exp\{\beta\,Q(s,a)\}\).
+Training-time implementations (e.g., DPMD/SDAC) impose this tilt in the loss; we seek an inference-time alternative that scales at test time without retraining the backbone.
+
+\paragraph{Framing.}
+We perform \emph{inference-only action updates} and do not retrain the base diffusion model.
+There is \emph{no separately trained dynamics}; we reuse the joint diffusion's conditional \(q_t(s'\mid a,s)\) as a dynamics surrogate.
+We use reverse--SDE PC as the default sampler.
+A probability--flow ODE (PF--ODE; DDIM-style) variant appears only in the appendix to isolate stochastic vs deterministic integration; no runtime comparisons are reported.
+
+\section{Target and Notation}
+\label{sec:target-notation}
+
+\paragraph{Base joint and score.}
+Let \(x=(a,s')\) with action \(a\in\mathcal A\) and successor \(s'\in\mathcal S\) conditioned on current state \(s\).
+Denote \(q_t(x\mid s)\) the VP family at noise level \(t\in[1\!\to\!0]\) (reverse time), and
+\[
+s_\theta(x,t)\;=\;\nabla_x \log q_t(x\mid s)
+\quad\text{with components}\quad
+s_\theta^{(a)}(a,s',t),\; s_\theta^{(s')}(a,s',t).
+\]
+Write \(\sigma_t\) for the VP standard deviation at level \(t\).
+
+\paragraph{Action-only tilted family.}
+For an annealing schedule \(\beta_t\in[0,\beta]\), define the product-of-experts target
+\begin{equation}
+\label{eq:tilted-family}
+\tilde q_t(a,s'\mid s)\;\propto\;\exp\!\Big(\log q_t(a,s'\mid s)\;+\;\beta_t\,Q_t(s,a)\Big).
+\end{equation}
+Because the energy term depends only on \(a\),
+\begin{equation}
+\label{eq:conditional-invariance}
+\tilde q_t(s'\mid a,s)\;=\;q_t(s'\mid a,s),
+\qquad
+\tilde q_t(a\mid s)\;\propto\;q_t(a\mid s)\,\exp\{\beta_t Q_t(s,a)\}.
+\end{equation}
+
+\paragraph{Noise-conditioned value.}
+We use pre-trained, noise-conditioned heads \(r_\rho(t,a,s')\) and \(V_\eta(t,s')\) and set
+\begin{equation}
+\label{eq:Qt}
+Q_t(s,a)\;=\;\E_{s'\sim q_t(\cdot\mid a,s)}\!\big[\,r_\rho(t,a,s')+\gamma\,V_\eta(t,s')\,\big].
+\end{equation}
+
+\paragraph{PoE action score.}
+The action component of the tilted score used by the sampler is
+\begin{equation}
+\label{eq:poe-action-score}
+\nabla_a \log \tilde q_t(a,s'\mid s)
+\;=\;
+s_\theta^{(a)}(a,s',t)\;+\;\beta_t\,\nabla_a Q_t(s,a).
+\end{equation}
+
+\paragraph{Marginal action-score identity (diagnostic).}
+The marginal action score satisfies
+\begin{equation}
+\label{eq:marginal-action-score}
+\nabla_a \log q_t(a\mid s)
+\;=\;
+\E_{s'\sim q_t(\cdot\mid a,s)}\big[\,s_\theta^{(a)}(a,s',t)\,\big],
+\end{equation}
+which we will use to assess the mixing quality of the \(s'\) refresh.
+
+\section{Method: Predictor--Corrector with PoE Action Score}
+\label{sec:sampler}
+
+\paragraph{Overview.}
+At each reverse noise level \(t_k\), we (i) refresh successors \(s'\) while clamping \(a\), (ii) estimate \(Q_t\) and \(\nabla_a Q_t\) by Monte Carlo over \(q_t(s'\mid a,s)\), and (iii) run a reverse--SDE predictor--corrector step where the \emph{action} drift uses the PoE action score
+\(s_\theta^{(a)}(a,s',t_k)+\beta_{t_k}\nabla_a Q_t(s,a)\).
+Optional safety: one preconditioned MALA step on \(a\); optional Barker/MALA accept on the final \(s'\) refresh.
+
+\paragraph{Schedules and numerics.}
+Guidance window \(t\in[t_{\min},t_{\max}]\) with default \([0.7,0.3]\).
+Annealing \(\beta_t=\min\!\big(\beta,\ \beta\,\sigma_t^2/\sigma_{t_{\max}}^2\big)\).
+Step sizes \(\eta_a=c_a\sigma_t^2\), \(\eta_s=c_s\sigma_t^2\), with \(c_a,c_s\in[0.05,0.2]\).
+Monte Carlo \(M\in\{4,8\}\) successors, refresh depth \(L\in\{1,2\}\).
+Diagonal preconditioners \(P_a,P_{s'}\).
+Clip \(\|s_\theta^{(a)}\|\) and \(\|\nabla_a Q_t\|\).
+
+\paragraph{Estimating \(Q_t\) and \(\nabla_a Q_t\).}
+With successors \(\{s'_m\}_{m=1}^M\sim q_t(\cdot\mid a,s)\),
+\[
+\widehat{Q}_t=\frac1M\sum_{m=1}^M\big[r_\rho(t,a,s'_m)+\gamma V_\eta(t,s'_m)\big].
+\]
+For \(\nabla_a Q_t\), use one of:
+(i) \emph{score-function (unbiased):}
+\(\nabla_a \E[f(s')]=\E[(s_\theta^{(a)}-\E s_\theta^{(a)})\,f(s')]\) with \(f(s')=r_\rho+\gamma V_\eta\);
+(ii) \emph{short backprop through refresh (low-variance):} reverse-mode through the \(L\) ULA steps with fixed CRNs to obtain \(J_{a\to s'}^\top\nabla_{s'}(\gamma V_\eta)\); combine with \(\nabla_a r_\rho\).
+Default: score-function; switch to short backprop if variance is high.
+
+\begin{algorithm}[t]
+\caption{Reverse--SDE PC with PoE action score and conditional $s'$ refresh}
+\label{alg:poe-pc}
+\DontPrintSemicolon
+\KwIn{state $s$; score $s_\theta$; value heads $r_\rho,V_\eta$; window $[t_{\min},t_{\max}]$; steps $\eta_a(t),\eta_s(t)$; precond.\ $P_a,P_{s'}$; MC sizes $M,L$; annealing $\{\beta_{t_k}\}$}
+Initialize $(a,\{s'^{(m)}\}_{m=1}^M)\sim q_{t_K}(\cdot\mid s)$\;
+\For{$k=K,\dots,1$}{
+  \tcp{1) Conditional $s'$ refresh with $a$ clamped}
+  \For{$m=1$ \KwTo $M$}{
+    \For{$\ell=1$ \KwTo $L$}{
+      $s'^{(m)} \leftarrow s'^{(m)} + \eta_s P_{s'}\, s_\theta^{(s')}(a,s'^{(m)},t_k) + \sqrt{2\eta_s P_{s'}}\,\zeta,\ \zeta\sim\mathcal N(0,I)$\;
+    }
+  }
+  \tcp{Optional: one Barker/MALA accept on the \emph{last} $s'$ refresh (off by default)}
+  \If{\texttt{opt\_accept\_sprime}}{
+    \texttt{AcceptRejectLastSprimeStep()}  \tcp*{see App.~\ref{app:mcmc}}
+  }
+  \tcp{2) Monte Carlo $\widehat{Q}_t$ and $\nabla_a Q_t$ at fixed $t_k$}
+  $\widehat{Q}_t \leftarrow \frac1M\sum_m \big[r_\rho(t_k,a,s'^{(m)})+\gamma V_\eta(t_k,s'^{(m)})\big]$\;
+  $\nabla_a \widehat{Q}_t \leftarrow$ \texttt{ScoreFunctionGradient} \emph{or} \texttt{ShortBackpropThroughRefresh}\;
+  \tcp{3) Predictor: reverse--SDE with PoE action score}
+  \If{$t_k\in[t_{\min},t_{\max}]$}{
+    $b^{(a)} \leftarrow \frac1M\sum_m s_\theta^{(a)}(a,s'^{(m)},t_k) + \beta_{t_k}\,\nabla_a \widehat{Q}_t$\;
+  }\Else{
+    $b^{(a)} \leftarrow \frac1M\sum_m s_\theta^{(a)}(a,s'^{(m)},t_k)$\;
+  }
+  $b^{(s')} \leftarrow \frac1M\sum_m s_\theta^{(s')}(a,s'^{(m)},t_k)$\;
+  \tcp{Apply one reverse--SDE predictor step to $x=(a,\bar s')$, using $b^{(a)},b^{(s')}$ as score components}
+  $(a,\{s'^{(m)}\}) \leftarrow \texttt{ReverseSDEPredictorStep}(a,\{s'^{(m)}\}, b^{(a)}, b^{(s')}, t_k\!\to\! t_{k-1})$\;
+  \tcp{4) Corrector: standard score-based corrector on $x$ (few iterations)}
+  $(a,\{s'^{(m)}\}) \leftarrow \texttt{ScoreCorrector}(a,\{s'^{(m)}\}, t_{k-1})$\;
+  \tcp{5) Optional: one MALA step on actions targeting $\tilde q_{t_{k-1}}$}
+  \If{\texttt{opt\_mala\_a}}{
+    $a' \leftarrow a + \eta_a P_a\, b^{(a)} + \sqrt{2\eta_a P_a}\,\xi,\ \xi\sim\mathcal N(0,I)$\;
+    Compute $\log \alpha$ for preconditioned MALA w.r.t.\ density $\tilde q_{t_{k-1}}(a,s')$ (App.~\ref{app:mcmc})\;
+    With prob.\ $\min(1,e^{\log\alpha})$ set $a\leftarrow a'$\;
+  }
+}
+\Return{$a$ at $t{=}0$}
+\end{algorithm}
+
+\paragraph{Predictor and corrector primitives.}
+\texttt{ReverseSDEPredictorStep} and \texttt{ScoreCorrector} are the standard reverse--SDE PC updates with the action-score component replaced by \(s_\theta^{(a)}+\beta_t\nabla_a Q_t\) inside the guidance window. We keep the base corrector iteration count unchanged; only the action drift is modified inside the window.
+
+\paragraph{Diagnostics.}
+Check the action-marginal score identity \eqref{eq:marginal-action-score} by comparing
+\(\widehat{\nabla_a \log q_t(a)}\equiv \frac1M\sum_m s_\theta^{(a)}(a,s'^{(m)},t)\)
+to the marginal estimate via conditional resampling. Large discrepancies indicate insufficient \(s'\) mixing; increase \(L\), reduce \(\eta_s\), or enable the optional accept step.
+
+\subsection{Value Heads and Guidance}
+\label{sec:value-heads}
+
+\paragraph{Heads and objective.}
+We use pre-trained, noise-conditioned heads \(r_\rho(t,a,s')\) and \(V_\eta(t,s')\) to form
+\begin{equation}
+\label{eq:Qt-def}
+Q_t(s,a)\;=\;\E_{s'\sim q_t(\cdot\mid a,s)}\!\big[\,r_\rho(t,a,s')+\gamma\,V_\eta(t,s')\,\big].
+\end{equation}
+Guidance always evaluates \(r_\rho,V_\eta\) on \emph{samples} \(s'\sim q_t(\cdot\mid a,s)\) from the current level \(t\). We do not use conditional-mean surrogates.
+
+\paragraph{Training data and corruption.}
+From replay tuples \((s,a,r,s')\), sample \(t\sim\mathcal U[t_{\min},t_{\max}]\) and corrupt \(s'\) to \(s'_t\) with the VP forward process at level \(t\).
+Feed \((t,a,s'_t)\) to \(r_\rho,V_\eta\).
+
+\paragraph{Losses.}
+We fit \(r_\rho\) to immediate rewards and \(V_\eta\) to a bootstrap target with a noise-consistency term:
+\begin{align}
+\mathcal L_r
+&= \E\big[(\,r_\rho(t,a,s'_t)-r\,)^2\big], \\
+\mathcal L_V
+&= \E\big[(\,V_\eta(0,s')-y\,)^2\big]\;+\;\lambda_{\mathrm{nc}}\;\E\big[(\,V_\eta(t,s'_t)-\mathrm{sg}[V_\eta(0,s')]\,)^2\big],
+\end{align}
+where \(y=r+\gamma\,\bar V(0,s')\) is a standard target with a slowly updated target network \(\bar V\), and \(\mathrm{sg}[\cdot]\) denotes stop-gradient.
+
+\paragraph{Action gradient.}
+Two estimators are supported; choose by variance:
+\begin{itemize}\setlength\itemsep{2pt}
+\item \textbf{Score-function (unbiased).} For \(f(s')=r_\rho(t,a,s')+\gamma V_\eta(t,s')\),
+\(\nabla_a Q_t(s,a)=\E[(\,s_\theta^{(a)}(a,s',t)-\E s_\theta^{(a)}(a,s',t)\,)\,f(s')]\).
+\item \textbf{Short backprop through refresh (low-variance).} With fixed CRNs through the \(L\) ULA refresh steps, compute
+\[
+\nabla_a Q_t(s,a)\;\approx\;\E[\nabla_a r_\rho(t,a,s')]\;+\;\E\big[J_{a\to s'}^\top\,\nabla_{s'}(\gamma V_\eta(t,s'))\big],
+\]
+where \(J_{a\to s'}^\top v\) is obtained by reverse-mode through the \(L\) refresh updates. Bias vanishes as \(L\!\uparrow\!\infty\), \(\eta_s\!\downarrow\!0\).
+\end{itemize}
+
+\section{Theory: Action-Only Tilt, Block Dynamics, and the MD Limit}
+\label{sec:theory}
+
+\paragraph{Tilted energy.}
+Define the energy at level \(t\) for \(x=(a,s')\):
+\begin{equation}
+\label{eq:tilted-energy}
+\mathcal E_t(a,s'\mid s)\;:=\;-\log q_t(a,s'\mid s)\;-\;\beta_t\,Q_t(s,a),
+\qquad
+\tilde q_t(a,s'\mid s)\;\propto\;e^{-\mathcal E_t(a,s'\mid s)}.
+\end{equation}
+By construction the tilt is action-only, so the conditional is unchanged:
+\(\tilde q_t(s'\mid a,s)=q_t(s'\mid a,s)\).
+
+\paragraph{Assumptions.}
+We work under standard score-SDE PC assumptions \citep{song2021sde} and mild regularity:
+(A1) score consistency; (A2) \(L\)-Lipschitz \(\nabla_a Q_t\) on the guidance window; (A3) dissipativity so per-level Langevin is geometrically ergodic; (A4) per-level mixing dominates path change across \(t\); (A5) small-step discretization \(\eta_{a,s}\to 0\) with \(\eta_{a,s}\propto\sigma_t^2\); if enabled, MH acceptance bounded away from 0.
+
+\begin{lemma}[Conditional invariance]\label{lem:cond-invariance}
+Because \(\beta_t Q_t(s,a)\) depends only on \(a\), \(\tilde q_t(s'\mid a,s)=q_t(s'\mid a,s)\).
+Any \(s'\)-only Langevin kernel with drift \(\nabla_{s'}\log q_t(a,s'\mid s)\) is reversible w.r.t.\ \(\tilde q_t\) in the \(\eta_s\to 0\) limit. At finite \(\eta_s\), ULA is biased; a single Barker/MALA accept on the last \(s'\) refresh removes this bias in the small-step limit \citep{RobertsTweedie1996MALA,LivingstoneZanella2022Barker}.
+\end{lemma}
+
+\begin{lemma}[Block dynamics at fixed \(t\)]\label{lem:block-fixed-t}
+Consider the coupled Langevin SDE at level \(t\) with drifts
+\[
+\dot a = \nabla_a\log q_t(a,s'\mid s) + \beta_t \nabla_a Q_t(s,a) + \sqrt{2P_a}\,\xi_a,
+\qquad
+\dot s' = \nabla_{s'}\log q_t(a,s'\mid s) + \sqrt{2P_{s'}}\,\xi_{s'}.
+\]
+Under (A2)–(A3) the invariant density is \(\tilde q_t\).
+ULA converges to this limit as \(\eta_{a,s}\to 0\); replacing ULA on \(a\) with preconditioned MALA yields an asymptotically exact kernel for \(\tilde q_t\) at fixed \(t\).
+\end{lemma}
+
+\begin{theorem}[PC tracking and MD marginal at \(t\to 0\)]\label{thm:md-limit}
+Under (A1)–(A5), a PC scheme that, at each \(t_k\), composes (i) \(L\) \(s'\)-refresh steps with drift \(\nabla_{s'}\log q_t\), (ii) an action update using the PoE action score \(s_\theta^{(a)}+\beta_{t_k}\nabla_a Q_t\), and (iii) standard reverse--SDE propagation in \(t\), yields laws converging to \(\tilde q_{t_k}\) per level as the mesh is refined.
+At \(t{=}0\), the action marginal equals the MD update
+\(\pi_\beta(a\mid s)\propto q(a\mid s)\exp\{\beta\,Q_0(s,a)\}\).
+\end{theorem}
+
+\paragraph{Caveats and bias control.}
+Shrinking PC/ULA step sizes removes discretization error but not score or \(Q_t\) approximation error.
+Deterministic PF--ODE/DDIM reduces integrator bias but cannot correct a wrong drift.
+A single MALA step on actions stabilizes late-noise updates; a Barker/MALA accept on the final \(s'\) refresh curbs conditional bias.
+
+\section{Baselines and Ablations}
+\label{sec:baselines-ablations}
+
+\paragraph{Baselines.}
+\textbf{DPMD/SDAC} (training-time MD tilt) \citep{ma2025efficient}. \;
+\textbf{Diffuser} with classifier/CF trajectory guidance (does not target MD action marginal) \citep{janner2022diffuser}. \;
+\textbf{Independence-MH on actions:} proposal \(a'\sim q(a\mid s)\), accept \(\min\{1,\exp[\beta(\hat Q_0(s,a')-\hat Q_0(s,a))]\}\) for a low-dim gold standard. \;
+\textbf{MPPI / softmax \(Q\):} draw \(K\) actions from \(q(a\mid s)\) and weight by \(\exp\{\beta \hat Q_0\}\).
+
+\paragraph{Importance-resampled $a_0$ (discrete MD proxy).}
+Draw $K$ i.i.d.\ actions $a_i\sim q(a\mid s)$ from the clean head ($t{=}0$).
+Compute weights $w_i \propto \exp\{\beta\,\hat Q_0(s,a_i)\}$ with $\sum_i w_i=1$ and either
+(i) resample a single action $\tilde a\sim\sum_i w_i\,\delta_{a_i}$ (discrete MD sampler), or
+(ii) take the weighted mean $\bar a=\sum_i w_i a_i$ (mean-field proxy).
+This gives a budgeted, non-gradient MD baseline and upper-bounds how much the inner MCMC improves over simple reweighting.
+
+\paragraph{Ablations.}
+PoE+PC vs PoE+PC+MALA(a); last-sweep Barker/MALA on \(s'\); action-score mixing diagnostic via \eqref{eq:marginal-action-score}.
+
+\subsection*{Decision-time accounting (per environment step)}
+We normalize by environment steps and report per-decision operation counts, not runtime:
+(i) base score evaluations, (ii) value-head evaluations \(r_\rho,V_\eta\), (iii) refresh ULA steps on \(s'\), and (iv) optional MH evaluations.
+PoE+PC uses one PC pass over \(K\) levels with \(M\) head evals and \(L\) refresh steps per level.
+PoE+PC+MALA(a) adds one MH ratio per level.
+Barker/MALA on \(s'\) adds one MH ratio at the last refresh only.
+MPPI/importance use \(K\) head evals and draws from \(q(a\mid s)\).
+DPMD/SDAC and Diffuser follow their authors’ decision-time budgets.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+\paragraph{Environments.}
+\emph{Online:} Reacher-v4 (low-dim), Ant-v4 (higher-dim). \;
+\emph{Offline planning:} Maze2D (UMaze/Medium/Large).
+
+\paragraph{Metrics.}
+\textbf{Primary:} mean return vs environment steps. \;
+\textbf{Secondary:} return vs decision-time budget measured in model evaluations per decision (score calls, value-head calls, refresh steps). \;
+Action entropy at \(t{=}0\); \textbf{OOD rate} = fraction of decisions where $\|s_\theta(x_{t^*},t^*)\|$ exceeds the 99th percentile of training-time score norms; NaN rate; if MALA enabled: acceptance and ESS. \;
+Diagnostic: gap between \(\E_{s'|a,s}[s_\theta^{(a)}]\) and batch-averaged joint \(s_\theta^{(a)}\).
+
+\paragraph{Protocol.}
+Seeds: 5. Window \([0.7,0.3]\) (plus late-only); \(\beta\in\{0.5,1.0,2.0\}\).
+Steps \(\eta_a=c_a\sigma_t^2\), \(\eta_s=c_s\sigma_t^2\), \(c_{a,s}\in\{0.05,0.1,0.2\}\).
+\(M\in\{4,8\}\), \(L\in\{1,2\}\).
+Clip \(\|s_\theta^{(a)}\|\), \(\|\nabla_a Q_t\|\).
+Options: MALA(a) one step; Barker/MALA on the last \(s'\) refresh.
+PF--ODE appears only in the appendix and is not used for comparisons.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Score-SDE, PF--ODE, PC.}
+Score-based generative modeling frames diffusion sampling as reverse SDE with PC updates or PF--ODE (DDIM) sharing marginals in the oracle-score limit \citep{song2021sde,ddim2020}.
+We rely on PC for correctness; PF--ODE is documented in the appendix.
+
+\paragraph{Guidance at inference time.}
+Classifier guidance adds external gradients at sampling time \citep{dhariwal2021beatgans}; classifier-free guidance mixes conditional and unconditional scores \citep{ho2022classifierfree}.
+Training-free guidance frameworks systematize schedules/recurrences and motivate our windowing/tuning \citep{ye2024tfg,bansal2023universal}.
+Our PoE action-score modification fits this family.
+
+\paragraph{Compositional generation and MCMC corrections.}
+Metropolis-corrected samplers fix objective mismatch for composed energies \citep{du2023reduce_reuse_recycle}.
+We follow the “change energy, then fix sampler” philosophy with optional one-step MALA on actions and a Barker/MALA accept on the last \(s'\) refresh.
+
+\paragraph{Inference-time local search.}
+“Inference-time scaling” composes annealed Langevin local search with classical search \citep{zhang2025inference_time_scaling}.
+We borrow only local search on actions and preserve the unchanged conditional over \(s'\).
+
+\paragraph{Mirror-descent in policy learning; trajectory diffusion.}
+DPMD/SDAC implement MD at training time \citep{ma2025efficient}.
+Diffuser denoises trajectories with guidance on the joint \citep{janner2022diffuser} and does not realize the MD action marginal.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\appendix
+\numberwithin{equation}{section}
+\numberwithin{algorithm}{section}
+
+\section{Deterministic PF--ODE variant (no runtime claims)}
+\label{app:pfode}
+Let \(\dot x_t = F_\theta(x_t,t)\) denote the PF--ODE drift induced by the base score model for \(x=(a,s')\) \citep{song2021sde,ddim2020}.
+Inside the guidance window, replace the \emph{action} component by \(s^{(a)}_\theta+\beta_t\nabla_a Q_t\); keep the state component unchanged.
+We do not add any \(s'\) stochastic refresh in ODE mode.
+Comparisons consider return vs environment steps only.
+
+\section{Additional Methods and Derivations}
+\label{app:extra}
+
+\subsection{Zhang-style (clean) option: requirements and gradients}
+\label{app:zhang-option}
+\paragraph{When to enable.}
+Enable the clean/recurrence path only if you have either:
+(i) a direct clean head \(Q_0(s,a)\) (so \(\nabla_{a_0}Q_0\) is available); or
+(ii) a principled MC estimator of \(\nabla_{a_0}Q_0(s,a_0)\) using the same machinery as in the noisy-\(Q_t\) path (refresh or resample \(s'\!\sim q(\cdot\mid a_0,s)\)).
+
+\paragraph{Clean-path update.}
+Let \(a_0=\hat a_0(a_t,s'_t,t)\).
+Use the chain rule
+\(\nabla_{a_t}\,Q_0(s,a_0)
+=
+(\partial \hat a_0/\partial a_t)^{\!\top}
+\,\nabla_{a_0}Q_0(s,a_0)\),
+with \(\nabla_{a_0}Q_0\) obtained via MC over \(q(s'\mid a_0,s)\) or the score-function estimator. Typically not cheaper than the noisy-\(Q_t\) path; keep as an appendix variant.
+
+\subsection{Short backprop through refresh and its consistency}
+\label{app:short-bprop}
+Consider \(L\) ULA refresh steps on \(s'\) with \(a\) clamped:
+\(s'_{\ell+1} = s'_\ell + \eta_s P_{s'}\,s_\theta^{(s')}(a,s'_\ell,t)+\sqrt{2\eta_s P_{s'}}\,\zeta_\ell\),
+with fixed common random numbers \(\{\zeta_\ell\}\).
+For a vector \(v\), define \(u_L=v\) and propagate reverse-mode
+\[
+w \leftarrow 0,\quad
+\text{for }\ell=L-1\downarrow 0:\ 
+\begin{cases}
+w \leftarrow w + \eta_s\,(\partial_a s_\theta^{(s')})^\top u_{\ell+1},\\
+u_\ell \leftarrow u_{\ell+1} + \eta_s\,(\partial_{s'} s_\theta^{(s')})^\top u_{\ell+1}.
+\end{cases}
+\]
+Return \(J_{a\to s'}^\top v \approx w\).
+
+\begin{proposition}[Consistency]\label{prop:consistency}
+Assume local Lipschitzness and dissipativity of \(s_\theta^{(s')}\) on the guidance window. Then as \(L\!\to\!\infty\) and \(\eta_s\!\to\!0\) with \(L\eta_s\to\tau>0\), the estimator converges to the Fréchet derivative of the \(L\)-step refresh map; bias is \(O(\eta_s)\) for fixed \(\tau\).
+\end{proposition}
+
+\subsection{Metropolis corrections: formulas and toggles}
+\label{app:mcmc}
+
+\paragraph{Preconditioned MALA on actions (single step).}
+Target at level \(t\): \(\tilde q_t(a,s'\mid s)\propto \exp(\log q_t(a,s'\mid s)+\beta_t Q_t(s,a))\).
+Given current \(a\), define drift
+\[
+\mu(a)=a+\eta_a P_a \Big(\underbrace{\E_{s'|a,s}[s_\theta^{(a)}(a,s',t)]}_{\approx \frac1M \sum_m s_\theta^{(a)}(a,s'^{(m)},t)} + \beta_t \nabla_a Q_t(s,a)\Big).
+\]
+Propose \(a'\sim\mathcal N(\mu(a),\,2\eta_a P_a)\). MH log-acceptance:
+\[
+\log\alpha
+=
+\big[\log \tilde q_t(a',s'\mid s)-\log \tilde q_t(a,s'\mid s)\big]
++\log \mathcal N\!\big(a;\mu(a'),2\eta_a P_a\big)-\log \mathcal N\!\big(a';\mu(a),2\eta_a P_a\big).
+\]
+
+\paragraph{Barker / MALA accept on last \(s'\) refresh.}
+On the \emph{last} refresh step, either:
+(i) MALA with proposal \(\mathcal N(s'+\eta_s P_{s'} s_\theta^{(s')},\,2\eta_s P_{s'})\); or
+(ii) Barker with symmetric proposal \(s'_\star=s'+\sqrt{2\eta_s P_{s'}}\,\zeta\) and
+\(\alpha_{\text{Barker}}=\sigma\!\big(-\Delta \mathcal E_t\big)\),
+\(\Delta \mathcal E_t=\mathcal E_t(a,s'_\star\mid s)-\mathcal E_t(a,s'\mid s)\),
+where \(\sigma\) is the logistic function and \(\mathcal E_t\) is in \eqref{eq:tilted-energy}.
+
+\begin{algorithm}[t]
+\caption{\texttt{AcceptRejectLastSprimeStep} (Barker or MALA)}
+\DontPrintSemicolon
+\KwIn{$a$, current $s'$, stepsize $\eta_s$, preconditioner $P_{s'}$, choice \texttt{barker} or \texttt{mala}, energy $\mathcal E_t$ in \eqref{eq:tilted-energy}}
+\uIf{\texttt{barker}}{
+  Propose $s'_\star \leftarrow s' + \sqrt{2\eta_s P_{s'}}\,\zeta$ \tcp*{symmetric}
+  $\Delta \mathcal E \leftarrow \mathcal E_t(a,s'_\star\mid s)-\mathcal E_t(a,s'\mid s)$\;
+  $\alpha \leftarrow \frac{1}{1+\exp(\Delta \mathcal E)}$ \tcp*{Barker}
+  Accept $s'\leftarrow s'_\star$ w.p.\ $\alpha$.
+}\Else(\texttt{mala}){
+  Propose $s'_\star \sim \mathcal N(s'+\eta_s P_{s'} s_\theta^{(s')}(a,s',t),\,2\eta_s P_{s'})$\;
+  Compute MH ratio with target $\tilde q_t$ and forward/backward Gaussians (as above); accept w.p.\ $\min(1,e^{\log\alpha})$.
+}
+\end{algorithm}
+
+\subsection{Action-marginal score identity (derivation)}
+\label{app:score-identity}
+Let \(q_t(a,s'\mid s)=q_t(s'\mid a,s)\,q_t(a\mid s)\). Differentiate:
+\begin{align*}
+\nabla_a \log q_t(a\mid s)
+&= \frac{\nabla_a q_t(a\mid s)}{q_t(a\mid s)}
+= \frac{\int \nabla_a q_t(a,s'\mid s)\,ds'}{\int q_t(a,s'\mid s)\,ds'}\\
+&= \int \frac{q_t(a,s'\mid s)}{q_t(a\mid s)}\,\nabla_a \log q_t(a,s'\mid s)\,ds'\\
+&= \E_{s'\sim q_t(\cdot\mid a,s)}\big[\nabla_a \log q_t(a,s'\mid s)\big]
+= \E_{s'|a,s}\big[s_\theta^{(a)}(a,s',t)\big].
+\end{align*}
+
+\end{document}
